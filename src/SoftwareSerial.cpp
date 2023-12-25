@@ -19,44 +19,35 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #include "SoftwareSerial.h"
-#include <Arduino.h>
+#include "impl.h"
+#include <driver/gpio.h>
+#include <esp_log.h> // for esp_log_early_timestamp
 
 using namespace EspSoftwareSerial;
 
-#ifndef ESP32
-uint32_t UARTBase::m_savedPS = 0;
-#else
-portMUX_TYPE UARTBase::m_interruptsMux = portMUX_INITIALIZER_UNLOCKED;
-#endif
+// from https://github.com/esp8266/Arduino/blob/d5eb265f78bff9deb7063d10030a02d021c8c66c/cores/esp8266/Stream.h#L2
+const uint32_t _timeout = 1000;
 
 ALWAYS_INLINE_ATTR inline void IRAM_ATTR UARTBase::disableInterrupts()
 {
-#ifndef ESP32
-    m_savedPS = xt_rsil(15);
-#else
-    taskENTER_CRITICAL(&m_interruptsMux);
-#endif
+    taskENTER_CRITICAL();
 }
 
 ALWAYS_INLINE_ATTR inline void IRAM_ATTR UARTBase::restoreInterrupts()
 {
-#ifndef ESP32
-    xt_wsr_ps(m_savedPS);
-#else
-    taskEXIT_CRITICAL(&m_interruptsMux);
-#endif
+    taskEXIT_CRITICAL();
 }
 
 constexpr uint8_t BYTE_ALL_BITS_SET = ~static_cast<uint8_t>(0);
 
-UARTBase::UARTBase() {
-}
-
-UARTBase::UARTBase(int8_t rxPin, int8_t txPin, bool invert)
+UARTBase::UARTBase(gpio_num_t rxPin, gpio_num_t txPin, bool invert)
 {
     m_rxPin = rxPin;
     m_txPin = txPin;
     m_invert = invert;
+
+    // enable gpio interrupts, though none are (yet) registered
+    gpio_install_isr_service(0);
 }
 
 UARTBase::~UARTBase() {
@@ -65,21 +56,49 @@ UARTBase::~UARTBase() {
 
 void UARTBase::setRxGPIOPinMode() {
     if (m_rxValid) {
-        pinMode(m_rxPin, m_rxGPIOHasPullUp && m_rxGPIOPullUpEnabled ? INPUT_PULLUP : INPUT);
+        // Setup Rx
+        // pinMode(m_rxPin, m_rxGPIOHasPullUp && m_rxGPIOPullUpEnabled ? INPUT_PULLUP : INPUT);
+        gpio_config_t io_conf = {};
+        io_conf.intr_type    = GPIO_INTR_DISABLE;
+        io_conf.mode         = GPIO_MODE_INPUT;
+        io_conf.pin_bit_mask = 1ULL << m_rxPin;
+
+        if (m_rxGPIOHasPullUp && m_rxGPIOPullUpEnabled) {
+            io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+            io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
+        }
+
+        gpio_config(&io_conf);
     }
 }
 
 void UARTBase::setTxGPIOPinMode() {
     if (m_txValid) {
-        pinMode(m_txPin, m_txGPIOOpenDrain ? OUTPUT_OPEN_DRAIN : OUTPUT);
+        // Setup Tx
+        // pinMode(m_txPin, m_txGPIOOpenDrain ? OUTPUT_OPEN_DRAIN : OUTPUT);
+        // TODO validate that the following matches the above
+        gpio_config_t io_conf = {};
+
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+
+        if (m_txGPIOOpenDrain) {
+            io_conf.mode = GPIO_MODE_OUTPUT_OD;
+        } else {
+            io_conf.mode = GPIO_MODE_OUTPUT;
+        }
+
+        io_conf.pin_bit_mask = 1ULL << m_txPin;
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
+        gpio_config(&io_conf);
     }
 }
 
 void UARTBase::begin(uint32_t baud, Config config,
-    int8_t rxPin, int8_t txPin,
+    gpio_num_t rxPin, gpio_num_t txPin,
     bool invert) {
-    if (-1 != rxPin) m_rxPin = rxPin;
-    if (-1 != txPin) m_txPin = txPin;
+    m_rxPin = rxPin;
+    m_txPin = txPin;
     m_oneWire = (m_rxPin == m_txPin);
     m_invert = invert;
     m_dataBits = 5 + (config & 07);
@@ -109,14 +128,11 @@ void UARTBase::beginRx(bool hasPullUp, int bufCapacity, int isrBufCapacity) {
 }
 
 void UARTBase::beginTx() {
-#if !defined(ESP8266)
-    m_txReg = portOutputRegister(digitalPinToPort(m_txPin));
-#endif
     m_txBitMask = digitalPinToBitMask(m_txPin);
     m_txValid = true;
     if (!m_oneWire) {
         setTxGPIOPinMode();
-        digitalWrite(m_txPin, !m_invert);
+        gpio_set_level(m_txPin, !m_invert);
     }
 }
 
@@ -137,16 +153,21 @@ uint32_t UARTBase::baudRate() {
     return microsToTicks(1000000UL) / m_bitTicks;
 }
 
-void UARTBase::setTransmitEnablePin(int8_t txEnablePin) {
-    if (-1 != txEnablePin) {
-        m_txEnableValid = true;
-        m_txEnablePin = txEnablePin;
-        pinMode(m_txEnablePin, OUTPUT);
-        digitalWrite(m_txEnablePin, LOW);
-    }
-    else {
-        m_txEnableValid = false;
-    }
+void UARTBase::setTransmitEnablePin(gpio_num_t txEnablePin) {
+    m_txEnableValid = true;
+    m_txEnablePin = txEnablePin;
+
+    //pinMode(m_txEnablePin, OUTPUT);
+    gpio_config_t io_conf = {};
+
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = 1ULL << m_txEnablePin;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+
+    gpio_set_level(m_txEnablePin, false);
 }
 
 void UARTBase::enableIntTx(bool on) {
@@ -168,7 +189,7 @@ void UARTBase::enableTx(bool on) {
         if (on) {
             enableRx(false);
             setTxGPIOPinMode();
-            digitalWrite(m_txPin, !m_invert);
+            gpio_set_level(m_txPin, !m_invert);
         }
         else {
             setRxGPIOPinMode();
@@ -183,13 +204,16 @@ void UARTBase::enableRx(bool on) {
             m_rxLastBit = m_pduBits - 1;
             // Init to stop bit level and current tick
             m_isrLastTick = (ticks() | 1) ^ m_invert;
-            if (m_bitTicks >= microsToTicks(1000000UL) / 74880UL)
-                attachInterruptArg(digitalPinToInterrupt(m_rxPin), reinterpret_cast<void (*)(void*)>(rxBitISR), this, CHANGE);
-            else
-                attachInterruptArg(digitalPinToInterrupt(m_rxPin), reinterpret_cast<void (*)(void*)>(rxBitSyncISR), this, m_invert ? RISING : FALLING);
+            gpio_isr_handler_add(m_rxPin, reinterpret_cast<void (*)(void*)>(rxBitISR), this);
+            if (m_bitTicks >= microsToTicks(1000000UL) / 74880UL) {
+                gpio_set_intr_type(m_rxPin, GPIO_INTR_ANYEDGE);
+            } else {
+                gpio_set_intr_type(m_rxPin, m_invert ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE);
+            }
+            // attachInterruptArg(digitalPinToInterrupt(m_rxPin), reinterpret_cast<void (*)(void*)>(rxBitSyncISR), this, m_invert ? RISING : FALLING);
         }
         else {
-            detachInterrupt(digitalPinToInterrupt(m_rxPin));
+            gpio_isr_handler_remove(m_rxPin);
         }
         m_rxEnabled = on;
     }
@@ -235,18 +259,18 @@ int UARTBase::read(uint8_t* buffer, size_t size) {
 size_t UARTBase::readBytes(uint8_t* buffer, size_t size) {
     if (!m_rxValid || !size) { return 0; }
     size_t count = 0;
-    auto start = millis();
+    auto start = esp_log_early_timestamp();
     do {
         auto readCnt = read(&buffer[count], size - count);
         count += readCnt;
         if (count >= size) break;
         if (readCnt) {
-            start = millis();
+            start = esp_log_early_timestamp();
         }
         else {
-            optimistic_yield(1000UL);
+            vTaskDelay(portTICK_PERIOD_MS);
         }
-    } while (millis() - start < _timeout);
+    } while (esp_log_early_timestamp() - start < _timeout);
     return count;
 }
 
@@ -255,7 +279,7 @@ int UARTBase::available() {
     rxBits();
     int avail = m_buffer->available();
     if (!avail) {
-        optimistic_yield(10000UL);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     return avail;
 }
@@ -266,13 +290,8 @@ void UARTBase::lazyDelay() {
     const auto expired = ticks() - m_periodStart;
     const int32_t remaining = m_periodDuration - expired;
     const uint32_t ms = remaining > 0 ? ticksToMicros(remaining) / 1000UL : 0;
-    if (ms > 0)
-    {
-        delay(ms);
-    }
-    else
-    {
-        optimistic_yield(10000UL);
+    if (ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(ms));
     }
     // Assure that below-ms part of delays are not elided
     preciseDelay();
@@ -294,16 +313,12 @@ void IRAM_ATTR UARTBase::writePeriod(
     preciseDelay();
     if (dutyCycle)
     {
-#if defined(ESP8266)
         if (16 == m_txPin) {
             GP16O = 1;
         }
         else {
             GPOS = m_txBitMask;
         }
-#else
-        *m_txReg = *m_txReg | m_txBitMask;
-#endif
         m_periodDuration += dutyCycle;
         if (offCycle || (withStopBit && !m_invert)) {
             if (!withStopBit || m_invert) {
@@ -316,16 +331,12 @@ void IRAM_ATTR UARTBase::writePeriod(
     }
     if (offCycle)
     {
-#if defined(ESP8266)
         if (16 == m_txPin) {
             GP16O = 0;
         }
         else {
             GPOC = m_txBitMask;
         }
-#else
-        *m_txReg = *m_txReg & ~m_txBitMask;
-#endif
         m_periodDuration += offCycle;
         if (withStopBit && m_invert) lazyDelay();
     }
@@ -348,7 +359,7 @@ size_t IRAM_ATTR UARTBase::write(const uint8_t* buffer, size_t size, Parity pari
     if (!m_txValid) { return -1; }
 
     if (m_txEnableValid) {
-        digitalWrite(m_txEnablePin, HIGH);
+        gpio_set_level(m_txEnablePin, true);
     }
     // Stop bit: if inverted, LOW, otherwise HIGH
     bool b = !m_invert;
@@ -426,7 +437,7 @@ size_t IRAM_ATTR UARTBase::write(const uint8_t* buffer, size_t size, Parity pari
         restoreInterrupts();
     }
     if (m_txEnableValid) {
-        digitalWrite(m_txEnablePin, LOW);
+        gpio_set_level(m_txEnablePin, false);
     }
     return size;
 }
@@ -459,16 +470,10 @@ int UARTBase::peek() {
 }
 
 void UARTBase::rxBits() {
-#ifdef ESP8266
     if (m_isrOverflow.load()) {
         m_overflow = true;
         m_isrOverflow.store(false);
     }
-#else
-    if (m_isrOverflow.exchange(false)) {
-        m_overflow = true;
-    }
-#endif
 
     m_isrBuffer->for_each(m_isrBufferForEachDel);
 
